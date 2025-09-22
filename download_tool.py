@@ -3,6 +3,7 @@ import re
 import requests
 from datetime import datetime
 import concurrent.futures
+import threading
 
 
 def list_m3u8_files():
@@ -48,11 +49,18 @@ def process_m3u8_file(selected_file, prefix_url):
     output_path = os.path.join(temp_dir, selected_file)
 
     with open(input_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+        lines = f.readlines()
 
-    # 修改内容：为所有.ts链接添加前置链接
-    pattern = r'^(.*?\.ts\?.*?)$'
-    modified_content = re.sub(pattern, prefix_url + r'\1', content, flags=re.MULTILINE)
+    modified_lines = []
+    for line in lines:
+        line_strip = line.strip()
+        if line_strip.endswith(".ts") or (".ts?" in line_strip):
+            # 保留原有的.ts链接及其query参数，加上前缀
+            modified_lines.append(prefix_url + line_strip + "\n")
+        else:
+            modified_lines.append(line)
+
+    modified_content = "".join(modified_lines)
 
     # 保存修改后的文件
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -62,9 +70,16 @@ def process_m3u8_file(selected_file, prefix_url):
 
 
 def download_ts_segment(url, segment_name, download_dir):
-    """下载单个TS片段"""
+    """下载单个TS片段，使用伪造请求头，保留URL的query参数"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+                      " Chrome/114.0.0.0 Safari/537.36",
+        "Referer": url,
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
     try:
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, headers=headers, timeout=30)
         if response.status_code == 200:
             filepath = os.path.join(download_dir, segment_name)
             with open(filepath, 'wb') as f:
@@ -79,32 +94,55 @@ def download_ts_segment(url, segment_name, download_dir):
 
 
 def download_all_segments(m3u8_content, download_dir, base_url="https://dtliving-sz.dingtalk.com/live/"):
-    """下载m3u8文件中的所有视频片段"""
+    """多线程下载m3u8文件中的所有视频片段，伪造请求头，保留query参数"""
     # 创建下载目录（如果不存在）
     if not os.path.exists(download_dir):
         os.makedirs(download_dir)
 
-    # 提取所有.ts链接
-    ts_pattern = r'^https?://.*?\.ts\?.*?$'
-    ts_urls = re.findall(ts_pattern, m3u8_content, re.MULTILINE)
+    # 提取所有.ts链接（完整URL，包含query参数）
+    lines = m3u8_content.splitlines()
+    ts_urls = []
+    for line in lines:
+        line_strip = line.strip()
+        if line_strip.startswith("http") and (".ts" in line_strip):
+            ts_urls.append(line_strip)
 
     if not ts_urls:
         print("未找到TS片段链接")
         return False
 
-    print(f"找到 {len(ts_urls)} 个TS片段，开始下载...")
+    # 询问用户并行下载线程数，默认为5
+    try:
+        thread_count_input = input("请输入并行下载线程数（默认5）: ").strip()
+        thread_count = int(thread_count_input) if thread_count_input else 5
+        if thread_count < 1:
+            print("线程数必须至少为1，使用默认值5")
+            thread_count = 5
+    except ValueError:
+        print("输入无效，使用默认线程数5")
+        thread_count = 5
 
-    # 使用线程池并发下载
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        for i, url in enumerate(ts_urls):
-            segment_name = f"segment_{i:04d}.ts"
-            futures.append(executor.submit(download_ts_segment, url, segment_name, download_dir))
+    print(f"找到 {len(ts_urls)} 个TS片段，开始下载，使用 {thread_count} 线程...")
 
-        # 等待所有下载完成
-        results = [future.result() for future in concurrent.futures.as_completed(futures)]
+    success_count = 0
+    total = len(ts_urls)
+    success_lock = threading.Lock()
 
-    success_count = sum(results)
+    def download_task(index_url):
+        i, url = index_url
+        segment_name = f"segment_{i:04d}.ts"
+        result = download_ts_segment(url, segment_name, download_dir)
+        nonlocal success_count
+        if result:
+            with success_lock:
+                success_count += 1
+        with success_lock:
+            print(f"下载第 {i+1}/{total} 个片段 ({((i+1)/total)*100:.1f}%)，已成功下载 {success_count} 个")
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+        list(executor.map(download_task, enumerate(ts_urls)))
+
     print(f"下载完成: {success_count}/{len(ts_urls)} 个片段成功下载")
 
     return success_count == len(ts_urls)
